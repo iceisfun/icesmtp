@@ -28,7 +28,7 @@ The library allows you to implement your own mail infrastructure (mailboxes, sto
 ## Installation
 
 ```bash
-go get icesmtp
+go get github.com/iceisfun/icesmtp
 ```
 
 ## Quick Start
@@ -41,8 +41,8 @@ import (
     "net"
     "log"
 
-    "icesmtp"
-    "icesmtp/mem"
+    "github.com/iceisfun/icesmtp"
+    "github.com/iceisfun/icesmtp/mem"
 )
 
 func main() {
@@ -137,8 +137,8 @@ import (
     "testing"
     "time"
 
-    "icesmtp"
-    "icesmtp/harness"
+    "github.com/iceisfun/icesmtp"
+    "github.com/iceisfun/icesmtp/harness"
 )
 
 func TestSMTPConversation(t *testing.T) {

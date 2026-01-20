@@ -16,7 +16,7 @@ icesmtp is designed for **socket-free testing**. All SMTP sessions operate over 
 The `harness` package provides a complete test environment:
 
 ```go
-import "icesmtp/harness"
+import "github.com/iceisfun/icesmtp/harness"
 
 func TestMyFeature(t *testing.T) {
     h := harness.NewHarness()

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"icesmtp"
+	"github.com/iceisfun/icesmtp"
 )
 
 // Mailbox is an in-memory Mailbox implementation using a static registry.

@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"icesmtp"
-	"icesmtp/mem"
+	"github.com/iceisfun/icesmtp"
+	"github.com/iceisfun/icesmtp/mem"
 )
 
 // Harness provides a test environment for SMTP sessions.

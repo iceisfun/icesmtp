@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"icesmtp"
-	"icesmtp/harness"
+	"github.com/iceisfun/icesmtp"
+	"github.com/iceisfun/icesmtp/harness"
 )
 
 func TestStreamingLargeMessage(t *testing.T) {

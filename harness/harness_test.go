@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"icesmtp"
+	"github.com/iceisfun/icesmtp"
 )
 
 func TestHarness_BasicConversation(t *testing.T) {

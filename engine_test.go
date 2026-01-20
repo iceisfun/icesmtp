@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"icesmtp/testdata"
+	"github.com/iceisfun/icesmtp/testdata"
 )
 
 // TestEngineTimeoutHandling tests that command timeouts work correctly.

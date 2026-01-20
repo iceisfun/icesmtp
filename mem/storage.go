@@ -1,4 +1,4 @@
-// Package mem provides in-memory implementations of icesmtp interfaces.
+// Package mem provides in-memory implementations of github.com/iceisfun/icesmtp interfaces.
 // These are suitable for testing and development but not production use.
 package mem
 
@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"icesmtp"
+	"github.com/iceisfun/icesmtp"
 )
 
 // Storage is an in-memory Storage implementation.
