@@ -1,7 +1,6 @@
 package icesmtp
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -473,29 +472,7 @@ func (e *Engine) handleDATA(ctx context.Context, cmd *Command) Response {
 		dataTimeout = 10 * time.Minute // Default
 	}
 
-	// Read message data with timeout
-	data, err := e.readData(ctx, dataTimeout)
-	if err != nil {
-		e.logger.Error(ctx, "error receiving message data", Attr(AttrError, err))
-		e.sm.Reset()
-		e.state.State = StateIdentified
-		e.envelope = nil
-
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrDeadlineExceeded) || isTimeoutError(err) {
-			return NewResponse(Reply451LocalError, "Timeout receiving message data")
-		}
-		return NewResponse(Reply451LocalError, "Error receiving message data")
-	}
-
-	// Check message size
-	if e.config.Limits.MaxMessageSize > 0 && int64(len(data)) > e.config.Limits.MaxMessageSize {
-		e.sm.Reset()
-		e.state.State = StateIdentified
-		e.envelope = nil
-		return NewResponse(Reply552ExceededStorage, "Message size exceeds limit")
-	}
-
-	// Write data to envelope - CHECK ERRORS
+	// Get data writer from envelope
 	writer, err := e.envelope.DataWriter()
 	if err != nil {
 		e.logger.Error(ctx, "failed to get data writer", Attr(AttrError, err))
@@ -505,26 +482,32 @@ func (e *Engine) handleDATA(ctx context.Context, cmd *Command) Response {
 		return NewResponse(Reply451LocalError, "Unable to accept message")
 	}
 
-	n, err := writer.Write(data)
+	// Stream message data
+	var bytesWritten int64
+	bytesWritten, err = e.streamData(ctx, writer, dataTimeout)
 	if err != nil {
-		e.logger.Error(ctx, "failed to write message data", Attr(AttrError, err))
-		writer.Close()
+		writer.Close() // Close on error
+		e.logger.Error(ctx, "error receiving message data", Attr(AttrError, err))
+
+		// Determine appropriate error response
+		var resp Response
+		if errors.Is(err, ErrMessageTooLarge) {
+			resp = NewResponse(Reply552ExceededStorage, "Message size exceeds limit")
+		} else if errors.Is(err, ErrLineTooLong) {
+			resp = NewResponse(Reply500SyntaxError, "Line too long")
+		} else if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrDeadlineExceeded) || isTimeoutError(err) {
+			resp = NewResponse(Reply451LocalError, "Timeout receiving message data")
+		} else {
+			resp = NewResponse(Reply451LocalError, "Error receiving message data")
+		}
+
 		e.sm.Reset()
 		e.state.State = StateIdentified
 		e.envelope = nil
-		return NewResponse(Reply451LocalError, "Error writing message data")
-	}
-	if n != len(data) {
-		e.logger.Error(ctx, "short write to message data",
-			Attr("expected", len(data)),
-			Attr("wrote", n))
-		writer.Close()
-		e.sm.Reset()
-		e.state.State = StateIdentified
-		e.envelope = nil
-		return NewResponse(Reply451LocalError, "Error writing message data")
+		return resp
 	}
 
+	// Close writer before finalizing
 	if err := writer.Close(); err != nil {
 		e.logger.Error(ctx, "failed to close data writer", Attr(AttrError, err))
 		e.sm.Reset()
@@ -574,12 +557,72 @@ func (e *Engine) handleDATA(ctx context.Context, cmd *Command) Response {
 
 	e.logger.Info(ctx, "message received",
 		Attr(AttrEnvelopeID, envelope.ID()),
-		Attr(AttrMessageSize, envelope.DataSize()),
+		Attr(AttrMessageSize, bytesWritten),
 		Attr(AttrRecipients, envelope.RecipientCount()))
 
 	return NewResponse(Reply250OK, fmt.Sprintf("OK, message %s accepted", envelope.ID()))
 }
 
+// streamData reads message data and writes it directly to the writer.
+// It enforces limits and handles dot-unstuffing.
+func (e *Engine) streamData(ctx context.Context, w io.Writer, timeout time.Duration) (int64, error) {
+	reader := NewDataLineReader()
+	var totalBytes int64
+
+	// Set initial deadline
+	deadline := time.Now().Add(timeout)
+	e.conn.SetReadDeadline(deadline)
+	defer e.conn.SetReadDeadline(time.Time{}) // Clear deadline when done
+
+	for {
+		select {
+		case <-ctx.Done():
+			return totalBytes, ctx.Err()
+		default:
+		}
+
+		line, err := e.conn.Reader().ReadBytes('\n')
+		if err != nil {
+			return totalBytes, err
+		}
+
+		// Update read stats
+		nRead := int64(len(line))
+		e.stats.BytesRead += nRead
+
+		// Extend deadline after each line received (reset timeout)
+		deadline = time.Now().Add(timeout)
+		e.conn.SetReadDeadline(deadline)
+
+		// Check for terminator
+		if reader.IsTerminator(line) {
+			break
+		}
+
+		// Check line length
+		if e.config.Limits.MaxLineLength > 0 && len(line) > e.config.Limits.MaxLineLength {
+			return totalBytes, ErrLineTooLong
+		}
+
+		// Unstuff line
+		unstuffed := reader.UnstuffLine(line)
+
+		// Check total size
+		addedBytes := int64(len(unstuffed))
+		if e.config.Limits.MaxMessageSize > 0 && totalBytes+addedBytes > e.config.Limits.MaxMessageSize {
+			return totalBytes, ErrMessageTooLarge
+		}
+
+		// Write to writer
+		n, err := w.Write(unstuffed)
+		if err != nil {
+			return totalBytes, err
+		}
+		totalBytes += int64(n)
+	}
+
+	return totalBytes, nil
+}
 func (e *Engine) handleRSET(ctx context.Context, cmd *Command) Response {
 	e.resetTransaction()
 	e.sm.Reset()
@@ -722,54 +765,7 @@ func (e *Engine) readLine(ctx context.Context, timeout time.Duration) ([]byte, e
 	return line, nil
 }
 
-// readData reads message data until the terminator with timeout.
-func (e *Engine) readData(ctx context.Context, timeout time.Duration) ([]byte, error) {
-	var buf bytes.Buffer
-	reader := NewDataLineReader()
-
-	// Set initial deadline
-	deadline := time.Now().Add(timeout)
-	e.conn.SetReadDeadline(deadline)
-	defer e.conn.SetReadDeadline(time.Time{}) // Clear deadline when done
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		line, err := e.conn.Reader().ReadBytes('\n')
-		if err != nil {
-			return nil, err
-		}
-		e.stats.BytesRead += int64(len(line))
-
-		// Extend deadline after each line received (reset timeout)
-		deadline = time.Now().Add(timeout)
-		e.conn.SetReadDeadline(deadline)
-
-		// Check for terminator
-		if reader.IsTerminator(line) {
-			break
-		}
-
-		// Check line length
-		if e.config.Limits.MaxLineLength > 0 && len(line) > e.config.Limits.MaxLineLength {
-			return nil, ErrLineTooLong
-		}
-
-		// Check total size
-		if e.config.Limits.MaxMessageSize > 0 && int64(buf.Len()+len(line)) > e.config.Limits.MaxMessageSize {
-			return nil, ErrMessageTooLarge
-		}
-
-		// Unstuff and write
-		buf.Write(reader.UnstuffLine(line))
-	}
-
-	return buf.Bytes(), nil
-}
+// readData is removed in favor of streamData
 
 // writeResponse writes an SMTP response.
 func (e *Engine) writeResponse(ctx context.Context, resp Response) error {
