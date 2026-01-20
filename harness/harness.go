@@ -5,6 +5,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	crypto_tls "crypto/tls"
 	"fmt"
 	"io"
 	"strings"
@@ -83,6 +84,20 @@ func WithExtensions(ext icesmtp.ExtensionSet) HarnessOption {
 	}
 }
 
+// WithTLSProvider sets the TLS provider.
+func WithTLSProvider(provider icesmtp.TLSProvider) HarnessOption {
+	return func(h *Harness) {
+		h.Config.TLSProvider = provider
+	}
+}
+
+// WithTLSPolicy sets the TLS policy.
+func WithTLSPolicy(policy icesmtp.TLSPolicy) HarnessOption {
+	return func(h *Harness) {
+		h.Config.TLSPolicy = policy
+	}
+}
+
 // NewHarness creates a new test harness with default configuration.
 func NewHarness(opts ...HarnessOption) *Harness {
 	storage := mem.NewStorage()
@@ -113,7 +128,25 @@ func NewHarness(opts ...HarnessOption) *Harness {
 // Start starts the SMTP engine.
 // Call this before sending commands.
 func (h *Harness) Start(ctx context.Context) {
-	h.Engine = icesmtp.NewEngine(h.Input, h.Output, h.Config)
+	// Create a PipeConn with deadline support
+	conn := icesmtp.WrapPipe(h.Input, h.Output)
+	h.Engine = icesmtp.NewEngineWithConn(conn, h.Config)
+
+	go func() {
+		if err := h.Engine.Run(ctx); err != nil && err != context.Canceled {
+			h.mu.Lock()
+			h.Errors = append(h.Errors, err)
+			h.mu.Unlock()
+		}
+	}()
+}
+
+// StartWithTLS starts the SMTP engine with TLS upgrade support for testing.
+// The tlsUpgrader function is called when STARTTLS upgrade is attempted.
+func (h *Harness) StartWithTLS(ctx context.Context, tlsUpgrader func(*crypto_tls.Config) (io.Reader, io.Writer, icesmtp.TLSConnectionState, error)) {
+	conn := icesmtp.WrapPipe(h.Input, h.Output)
+	conn.SetTLSUpgrader(tlsUpgrader)
+	h.Engine = icesmtp.NewEngineWithConn(conn, h.Config)
 
 	go func() {
 		if err := h.Engine.Run(ctx); err != nil && err != context.Canceled {
@@ -310,11 +343,13 @@ type ConversationStep struct {
 }
 
 // PipeBuffer is a thread-safe buffer for simulating I/O.
+// It supports deadline-based reads for timeout testing.
 type PipeBuffer struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	buf    bytes.Buffer
-	closed bool
+	mu           sync.Mutex
+	cond         *sync.Cond
+	buf          bytes.Buffer
+	closed       bool
+	readDeadline time.Time
 }
 
 // NewPipeBuffer creates a new pipe buffer.
@@ -338,13 +373,38 @@ func (p *PipeBuffer) Write(data []byte) (int, error) {
 	return n, err
 }
 
-// Read reads data from the buffer.
+// Read reads data from the buffer with deadline support.
 func (p *PipeBuffer) Read(data []byte) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// Check deadline
+	deadline := p.readDeadline
+
 	for p.buf.Len() == 0 && !p.closed {
+		// Check if deadline has passed
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return 0, icesmtp.ErrDeadlineExceeded
+		}
+
+		// Wait with timeout if deadline is set
+		if !deadline.IsZero() {
+			timeout := time.Until(deadline)
+			if timeout <= 0 {
+				return 0, icesmtp.ErrDeadlineExceeded
+			}
+			// Use a timed wait
+			go func() {
+				time.Sleep(timeout)
+				p.cond.Broadcast()
+			}()
+		}
 		p.cond.Wait()
+
+		// Re-check deadline after wake
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return 0, icesmtp.ErrDeadlineExceeded
+		}
 	}
 
 	if p.buf.Len() == 0 && p.closed {
@@ -352,6 +412,15 @@ func (p *PipeBuffer) Read(data []byte) (int, error) {
 	}
 
 	return p.buf.Read(data)
+}
+
+// SetReadDeadline sets the deadline for future Read calls.
+func (p *PipeBuffer) SetReadDeadline(t time.Time) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.readDeadline = t
+	p.cond.Broadcast() // Wake any waiters to re-check deadline
+	return nil
 }
 
 // ReadLine reads a line from the buffer.

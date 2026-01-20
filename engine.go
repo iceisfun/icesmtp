@@ -1,23 +1,23 @@
 package icesmtp
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"time"
 )
 
 // Engine is the core SMTP protocol engine.
-// It handles a single SMTP session over an io.Reader/io.Writer pair.
+// It handles a single SMTP session over a Conn.
 type Engine struct {
 	config SessionConfig
-	reader *bufio.Reader
-	writer io.Writer
+	conn   *BufferedConn
 	parser *Parser
 	sm     *StateMachine
 	state  *SessionState
@@ -61,12 +61,32 @@ func WithSessionID(id SessionID) EngineOption {
 	}
 }
 
-// NewEngine creates a new SMTP engine.
+// NewEngine creates a new SMTP engine from io.Reader/io.Writer.
+// If the reader implements net.Conn (e.g., when passing a net.Conn as both
+// reader and writer), it will be wrapped with NetConn for full timeout and
+// TLS support. Otherwise, a PipeConn is used.
 func NewEngine(r io.Reader, w io.Writer, config SessionConfig, opts ...EngineOption) *Engine {
+	// Check if reader is a net.Conn - this handles the common case of
+	// NewEngine(conn, conn, config) where conn is a net.Conn
+	if netConn, ok := r.(net.Conn); ok {
+		return NewEngineFromNetConn(netConn, config, opts...)
+	}
+	conn := WrapPipe(r, w)
+	return NewEngineWithConn(conn, config, opts...)
+}
+
+// NewEngineFromNetConn creates a new SMTP engine from a net.Conn.
+// This provides full timeout and TLS support.
+func NewEngineFromNetConn(netConn net.Conn, config SessionConfig, opts ...EngineOption) *Engine {
+	conn := WrapNetConn(netConn)
+	return NewEngineWithConn(conn, config, opts...)
+}
+
+// NewEngineWithConn creates a new SMTP engine with a Conn.
+func NewEngineWithConn(conn Conn, config SessionConfig, opts ...EngineOption) *Engine {
 	e := &Engine{
 		config:    config,
-		reader:    bufio.NewReader(r),
-		writer:    w,
+		conn:      NewBufferedConn(conn),
 		parser:    NewParser(),
 		sm:        NewStateMachine(),
 		state:     &SessionState{State: StateDisconnected},
@@ -138,19 +158,26 @@ func (e *Engine) Run(ctx context.Context) error {
 			break
 		}
 
-		// Set command timeout
-		cmdCtx := ctx
-		if e.config.Limits.CommandTimeout > 0 {
-			var cancel context.CancelFunc
-			cmdCtx, cancel = context.WithTimeout(ctx, e.config.Limits.CommandTimeout)
-			defer cancel()
+		// Check if we need to perform TLS upgrade
+		if e.state.State == StateStartTLS {
+			if err := e.performTLSUpgrade(ctx); err != nil {
+				e.logger.Error(ctx, "TLS upgrade failed", Attr(AttrError, err))
+				return e.handleDisconnect(ctx, DisconnectTLSFailure, err)
+			}
+			continue
 		}
 
-		// Read and process command
-		if err := e.processOneCommand(cmdCtx); err != nil {
+		// Read and process command with timeout
+		if err := e.processOneCommand(ctx); err != nil {
 			if e.sm.State().IsTerminal() {
 				break
 			}
+
+			// Check for timeout
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrDeadlineExceeded) || isTimeoutError(err) {
+				return e.handleDisconnect(ctx, DisconnectTimeout, err)
+			}
+
 			// Check if this is a protocol error vs. I/O error
 			if isIOError(err) {
 				return e.handleDisconnect(ctx, DisconnectError, err)
@@ -164,8 +191,14 @@ func (e *Engine) Run(ctx context.Context) error {
 
 // processOneCommand reads and processes a single SMTP command.
 func (e *Engine) processOneCommand(ctx context.Context) error {
-	// Read command line
-	line, err := e.readLine(ctx)
+	// Determine timeout to use
+	timeout := e.config.Limits.CommandTimeout
+	if timeout == 0 {
+		timeout = e.config.Limits.IdleTimeout
+	}
+
+	// Read command line with timeout
+	line, err := e.readLine(ctx, timeout)
 	if err != nil {
 		return err
 	}
@@ -353,6 +386,10 @@ func (e *Engine) handleMAIL(ctx context.Context, cmd *Command) Response {
 		TLSActive:         e.state.TLSActive,
 		AuthenticatedUser: e.state.AuthenticatedUser,
 	}
+	if e.state.TLSState != nil {
+		metadata.TLSVersion = e.state.TLSState.VersionString()
+		metadata.TLSCipherSuite = e.state.TLSState.CipherSuiteString()
+	}
 
 	if e.config.EnvelopeFactory != nil {
 		e.envelope = e.config.EnvelopeFactory.NewBuilder(metadata)
@@ -430,10 +467,23 @@ func (e *Engine) handleDATA(ctx context.Context, cmd *Command) Response {
 		return Response{} // Already sent, error handled
 	}
 
-	// Read message data
-	data, err := e.readData(ctx)
+	// Determine data timeout
+	dataTimeout := e.config.Limits.DataTimeout
+	if dataTimeout == 0 {
+		dataTimeout = 10 * time.Minute // Default
+	}
+
+	// Read message data with timeout
+	data, err := e.readData(ctx, dataTimeout)
 	if err != nil {
-		e.sm.Abort()
+		e.logger.Error(ctx, "error receiving message data", Attr(AttrError, err))
+		e.sm.Reset()
+		e.state.State = StateIdentified
+		e.envelope = nil
+
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrDeadlineExceeded) || isTimeoutError(err) {
+			return NewResponse(Reply451LocalError, "Timeout receiving message data")
+		}
 		return NewResponse(Reply451LocalError, "Error receiving message data")
 	}
 
@@ -441,36 +491,71 @@ func (e *Engine) handleDATA(ctx context.Context, cmd *Command) Response {
 	if e.config.Limits.MaxMessageSize > 0 && int64(len(data)) > e.config.Limits.MaxMessageSize {
 		e.sm.Reset()
 		e.state.State = StateIdentified
+		e.envelope = nil
 		return NewResponse(Reply552ExceededStorage, "Message size exceeds limit")
 	}
 
-	// Write data to envelope
+	// Write data to envelope - CHECK ERRORS
 	writer, err := e.envelope.DataWriter()
 	if err != nil {
+		e.logger.Error(ctx, "failed to get data writer", Attr(AttrError, err))
 		e.sm.Reset()
 		e.state.State = StateIdentified
+		e.envelope = nil
 		return NewResponse(Reply451LocalError, "Unable to accept message")
 	}
-	writer.Write(data)
-	writer.Close()
+
+	n, err := writer.Write(data)
+	if err != nil {
+		e.logger.Error(ctx, "failed to write message data", Attr(AttrError, err))
+		writer.Close()
+		e.sm.Reset()
+		e.state.State = StateIdentified
+		e.envelope = nil
+		return NewResponse(Reply451LocalError, "Error writing message data")
+	}
+	if n != len(data) {
+		e.logger.Error(ctx, "short write to message data",
+			Attr("expected", len(data)),
+			Attr("wrote", n))
+		writer.Close()
+		e.sm.Reset()
+		e.state.State = StateIdentified
+		e.envelope = nil
+		return NewResponse(Reply451LocalError, "Error writing message data")
+	}
+
+	if err := writer.Close(); err != nil {
+		e.logger.Error(ctx, "failed to close data writer", Attr(AttrError, err))
+		e.sm.Reset()
+		e.state.State = StateIdentified
+		e.envelope = nil
+		return NewResponse(Reply451LocalError, "Error finalizing message data")
+	}
 
 	// Finalize envelope
 	envelope, err := e.envelope.Finalize()
 	if err != nil {
+		e.logger.Error(ctx, "failed to finalize envelope", Attr(AttrError, err))
 		e.sm.Reset()
 		e.state.State = StateIdentified
+		e.envelope = nil
 		return NewResponse(Reply451LocalError, "Unable to finalize message")
 	}
 
 	// Store message
 	if e.config.Storage != nil {
-		_, err := e.config.Storage.Store(ctx, envelope)
+		receipt, err := e.config.Storage.Store(ctx, envelope)
 		if err != nil {
 			e.sm.Reset()
 			e.state.State = StateIdentified
+			e.envelope = nil
 			e.logger.Error(ctx, "storage error", Attr(AttrError, err))
 			return NewResponse(Reply451LocalError, "Unable to store message")
 		}
+		e.logger.Debug(ctx, "message stored",
+			Attr("storage_id", receipt.MessageID),
+			Attr("bytes_written", receipt.BytesWritten))
 	}
 
 	// Update stats
@@ -531,10 +616,20 @@ func (e *Engine) handleHELP(ctx context.Context, cmd *Command) Response {
 		return ResponseCommandNotImplemented
 	}
 
+	// Build command list dynamically based on what's actually available
+	basicCmds := "HELO EHLO MAIL RCPT DATA"
+	additionalCmds := "RSET NOOP QUIT HELP"
+
+	// Only include STARTTLS if it's actually available
+	// (same conditions as EHLO advertisement)
+	if e.config.Extensions.STARTTLS && e.config.TLSPolicy != TLSDisabled && e.config.TLSProvider != nil && !e.state.TLSActive {
+		additionalCmds += " STARTTLS"
+	}
+
 	return NewMultilineResponse(Reply214HelpMessage,
 		"Supported commands:",
-		"HELO EHLO MAIL RCPT DATA",
-		"RSET NOOP QUIT HELP",
+		basicCmds,
+		additionalCmds,
 		"For more information, consult RFC 5321",
 	)
 }
@@ -552,17 +647,74 @@ func (e *Engine) handleSTARTTLS(ctx context.Context, cmd *Command) Response {
 		return NewResponse(Reply454TLSNotAvailable, "TLS not available")
 	}
 
+	// Transition to STARTTLS state - actual upgrade happens in main loop
 	e.sm.TransitionForCommand(CmdSTARTTLS, true)
 	e.state.State = StateStartTLS
 
-	// TLS upgrade happens after we return this response
-	// The actual upgrade is handled by the caller
 	return NewResponse(Reply220ServiceReady, "Ready to start TLS")
 }
 
-// readLine reads a line from the client.
-func (e *Engine) readLine(ctx context.Context) ([]byte, error) {
-	line, err := e.reader.ReadBytes('\n')
+// performTLSUpgrade performs the TLS handshake after STARTTLS response is sent.
+func (e *Engine) performTLSUpgrade(ctx context.Context) error {
+	// Get TLS config from provider
+	tlsConfig, err := e.config.TLSProvider.GetConfig(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to get TLS config: %w", err)
+	}
+
+	// Determine handshake timeout - use CommandTimeout or a reasonable default
+	handshakeTimeout := e.config.Limits.CommandTimeout
+	if handshakeTimeout == 0 {
+		handshakeTimeout = 30 * time.Second // Default TLS handshake timeout
+	}
+
+	// Set deadline for the handshake to prevent DoS attacks where client
+	// sends STARTTLS but never completes the handshake
+	deadline := time.Now().Add(handshakeTimeout)
+	e.conn.SetReadDeadline(deadline)
+	e.conn.SetWriteDeadline(deadline)
+
+	// Perform the TLS handshake
+	tlsState, err := e.conn.UpgradeTLS(tlsConfig)
+
+	// Clear deadlines regardless of success/failure
+	e.conn.SetReadDeadline(time.Time{})
+	e.conn.SetWriteDeadline(time.Time{})
+
+	if err != nil {
+		return fmt.Errorf("TLS handshake failed: %w", err)
+	}
+
+	// Update state
+	e.state.TLSActive = true
+	e.state.TLSState = &tlsState
+
+	// Reset the buffered reader since the underlying connection changed
+	e.conn.ResetReader()
+
+	// Per RFC 3207, after STARTTLS the session returns to initial state
+	// Client must send EHLO again
+	e.sm.TLSComplete()
+	e.state.State = StateGreeted
+
+	// Reset any transaction state
+	e.resetTransaction()
+	e.state.ClientHostname = ""
+
+	if e.config.Hooks != nil {
+		e.config.Hooks.OnTLSUpgrade(ctx, tlsState, e)
+	}
+
+	e.logger.Info(ctx, "TLS upgraded",
+		Attr(AttrTLSVersion, tlsState.VersionString()),
+		Attr(AttrCipherSuite, tlsState.CipherSuiteString()))
+
+	return nil
+}
+
+// readLine reads a line from the client with timeout.
+func (e *Engine) readLine(ctx context.Context, timeout time.Duration) ([]byte, error) {
+	line, err := e.conn.ReadLine(timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -570,10 +722,15 @@ func (e *Engine) readLine(ctx context.Context) ([]byte, error) {
 	return line, nil
 }
 
-// readData reads message data until the terminator.
-func (e *Engine) readData(ctx context.Context) ([]byte, error) {
+// readData reads message data until the terminator with timeout.
+func (e *Engine) readData(ctx context.Context, timeout time.Duration) ([]byte, error) {
 	var buf bytes.Buffer
 	reader := NewDataLineReader()
+
+	// Set initial deadline
+	deadline := time.Now().Add(timeout)
+	e.conn.SetReadDeadline(deadline)
+	defer e.conn.SetReadDeadline(time.Time{}) // Clear deadline when done
 
 	for {
 		select {
@@ -582,11 +739,15 @@ func (e *Engine) readData(ctx context.Context) ([]byte, error) {
 		default:
 		}
 
-		line, err := e.reader.ReadBytes('\n')
+		line, err := e.conn.Reader().ReadBytes('\n')
 		if err != nil {
 			return nil, err
 		}
 		e.stats.BytesRead += int64(len(line))
+
+		// Extend deadline after each line received (reset timeout)
+		deadline = time.Now().Add(timeout)
+		e.conn.SetReadDeadline(deadline)
 
 		// Check for terminator
 		if reader.IsTerminator(line) {
@@ -613,7 +774,7 @@ func (e *Engine) readData(ctx context.Context) ([]byte, error) {
 // writeResponse writes an SMTP response.
 func (e *Engine) writeResponse(ctx context.Context, resp Response) error {
 	data := resp.Bytes()
-	n, err := e.writer.Write(data)
+	n, err := e.conn.Write(data)
 	e.stats.BytesWritten += int64(n)
 
 	e.logger.Debug(ctx, "sent response",
@@ -670,15 +831,27 @@ func isIOError(err error) bool {
 	return err == io.EOF || err == io.ErrUnexpectedEOF || err == io.ErrClosedPipe
 }
 
+// isTimeoutError checks if an error is a timeout error.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	return false
+}
+
 // SessionInfo interface implementation
 
-func (e *Engine) ID() SessionID                      { return e.sessionID }
-func (e *Engine) State() State                       { return e.state.State }
-func (e *Engine) ClientHostname() Hostname           { return e.state.ClientHostname }
-func (e *Engine) ClientIP() IPAddress                { return e.clientIP }
-func (e *Engine) TLSActive() bool                    { return e.state.TLSActive }
-func (e *Engine) Authenticated() bool                { return e.state.Authenticated }
-func (e *Engine) AuthenticatedUser() Username        { return e.state.AuthenticatedUser }
+func (e *Engine) ID() SessionID               { return e.sessionID }
+func (e *Engine) State() State                { return e.state.State }
+func (e *Engine) ClientHostname() Hostname    { return e.state.ClientHostname }
+func (e *Engine) ClientIP() IPAddress         { return e.clientIP }
+func (e *Engine) TLSActive() bool             { return e.state.TLSActive }
+func (e *Engine) Authenticated() bool         { return e.state.Authenticated }
+func (e *Engine) AuthenticatedUser() Username { return e.state.AuthenticatedUser }
 func (e *Engine) CurrentRecipientCount() RecipientCount {
 	if e.envelope == nil {
 		return 0
@@ -700,7 +873,7 @@ func (e *Engine) Close() error {
 	e.closed = true
 	e.mu.Unlock()
 	e.sm.Abort()
-	return nil
+	return e.conn.Close()
 }
 
 // Reply code for TLS not available.
